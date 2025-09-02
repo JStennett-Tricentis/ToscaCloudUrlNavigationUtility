@@ -18,6 +18,46 @@ class LogParser {
 		}
 	}
 
+	// Normalize and split log text into lines, even when content is a single long line
+	splitLogTextIntoLines(logText) {
+		try {
+			// Normalize line endings first
+			let normalized = (logText || '').replace(/\r\n?/g, '\n');
+
+			// Primary split on real newlines
+			let lines = normalized.split('\n');
+
+			// If everything is crammed into 1-2 lines, attempt smart splitting on timestamped log prefixes
+			if (lines.length <= 2) {
+				// Split at each occurrence of a timestamp followed by log level/component, keeping the delimiter at start of each line
+				// Example matched prefix: 2025-09-02 09:22:22Z [INF][Recording]
+				const timestampLookahead = /(?=\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\s*\[[A-Z]{3}\]\[[^\]]+\])/g;
+				const tsSplit = normalized.split(timestampLookahead).filter(part => part && part.trim().length > 0);
+				if (tsSplit.length > lines.length) {
+					lines = tsSplit;
+				}
+			}
+
+			// Fallback: split on repeated buffer markers if still too few lines
+			if (lines.length <= 2) {
+				const bufferMarkerLookahead = /(?=Message:\s*Buffer with name)/gi;
+				const bufferSplit = normalized.split(bufferMarkerLookahead).filter(part => part && part.trim().length > 0);
+				if (bufferSplit.length > lines.length) {
+					lines = bufferSplit;
+				}
+			}
+
+			// Final cleanup: trim lines and remove empties
+			lines = lines.map(l => l.trim()).filter(l => l.length > 0);
+
+			this.log(`splitLogTextIntoLines: ${lines.length} lines after normalization`);
+			return lines;
+		} catch (e) {
+			this.log('splitLogTextIntoLines error', e);
+			return (logText || '').split('\n');
+		}
+	}
+
 	// Simplified JSON detection
 	isValidJSON(str) {
 		if (!str || typeof str !== 'string') return false;
@@ -84,11 +124,19 @@ class LogParser {
 		let escapeNext = false;
 		let currentIndex = startIndex;
 
-		// Find the start of JSON content
+		// Find the start of JSON content - look for value: followed by quotes and opening brace
 		let startLine = lines[startIndex];
-		let jsonStartPos = startLine.indexOf('{');
+
+		// First try to find the value position after "has been set to value:"
+		let valueMatch = startLine.match(/has been set to value[:\s]+['"]/i);
+		let searchStartPos = 0;
+		if (valueMatch) {
+			searchStartPos = startLine.indexOf(valueMatch[0]) + valueMatch[0].length;
+		}
+
+		let jsonStartPos = startLine.indexOf('{', searchStartPos);
 		if (jsonStartPos === -1) {
-			jsonStartPos = startLine.indexOf('[');
+			jsonStartPos = startLine.indexOf('[', searchStartPos);
 		}
 
 		if (jsonStartPos === -1) {
@@ -189,19 +237,23 @@ class LogParser {
 
 	// Clean log prefixes from lines
 	cleanLogPrefix(line) {
-		// Remove timestamp, log level, and optionally "Message: " prefix
-		let cleaned = line.replace(/^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^[]*\[TBox\]\s*/, '');
+		// Remove timestamp, log level, and TBox prefix with any indentation
+		let cleaned = line.replace(/^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^[]*\[[^\]]*\]\[[^\]]*\]\s*/, '');
+		// Also remove any remaining log prefix patterns
+		cleaned = cleaned.replace(/^\[[^\]]*\]\s*/, '');
 		// Also remove "Message: " prefix if present
 		cleaned = cleaned.replace(/^Message:\s*/, '');
-		return cleaned;
+		return cleaned.trim();
 	}
 
 	// Main parsing method with improved error handling
 	parseLogContent(logText) {
 		try {
-			const lines = logText.split('\n');
+			const lines = this.splitLogTextIntoLines(logText);
 			const variables = [];
 			let lineNumber = 0;
+
+			console.log('🔍 Starting to parse', lines.length, 'lines');
 
 			lines.forEach((line, index) => {
 				lineNumber = index + 1;
@@ -209,15 +261,22 @@ class LogParser {
 
 				const trimmedLine = line.trim();
 
+				// Debug: Check for buffer lines
+				if (trimmedLine.toLowerCase().includes('buffer with name')) {
+					console.log('🔍 Found buffer line at', lineNumber, ':', trimmedLine.substring(0, 100));
+				}
+
 				// Extract buffer variables with improved multi-line handling
-				// Account for "Message: " prefix and different quote/colon patterns
+				// Account for "Message: " prefix and different quote/colon patterns (both single and double quotes)
+				// More flexible pattern to handle variations in spacing and punctuation
 				const bufferMatch = trimmedLine.match(/(?:Message:\s*)?Buffer with name[:\s]*['"]([^'"]*)['"]\s*has been set to value[:\s]*['"]?/i);
 				if (bufferMatch) {
+					console.log('🔍 Buffer match found at line', lineNumber, ':', bufferMatch[0]);
 					const variableName = bufferMatch[1];
 					let variableValue = '';
 
-					// Check if value is on same line
-					const sameLineMatch = trimmedLine.match(/(?:Message:\s*)?Buffer with name[:\s]*['"]([^'"]*)['"]\s*has been set to value[:\s]*['"]([^'"]*)['"]/i);
+					// Check if value is on same line - handle both single and double quotes, and optional trailing period
+					const sameLineMatch = trimmedLine.match(/(?:Message:\s*)?Buffer with name[:\s]*['"]([^'"]*)['"]\s*has been set to value[:\s]*['"]([^'"]*)['"]\.?/i);
 					if (sameLineMatch) {
 						variableValue = sameLineMatch[2];
 					} else {
@@ -288,17 +347,20 @@ class LogParser {
 
 	// Filter logs to relevant sections
 	filterRelevantLogs(logText) {
-		const lines = logText.split('\n');
-		let startIndex = -1;
+		// For now, return all logs to ensure we capture all buffer variables
+		// The original filter was too restrictive and skipped important data
+		return logText;
 
-		for (let i = 0; i < lines.length; i++) {
-			if (lines[i].includes('Starting TestCase')) {
-				startIndex = i;
-				break;
-			}
-		}
-
-		return startIndex !== -1 ? lines.slice(startIndex).join('\n') : logText;
+		// Original code kept for reference:
+		// const lines = logText.split('\n');
+		// let startIndex = -1;
+		// for (let i = 0; i < lines.length; i++) {
+		//     if (lines[i].includes('Starting TestCase')) {
+		//         startIndex = i;
+		//         break;
+		//     }
+		// }
+		// return startIndex !== -1 ? lines.slice(startIndex).join('\n') : logText;
 	}
 }
 
